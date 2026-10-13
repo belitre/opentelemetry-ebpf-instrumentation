@@ -50,6 +50,14 @@ func qName(om *informer.ObjectMeta) qualifiedName {
 	return qualifiedName{name: om.Name, namespace: om.Namespace, kind: om.Kind}
 }
 
+// keepsIP returns true if the current owner of an IP keeps it against another object: a finished Pod still
+// reports its IP, which the CNI can already have given to a new Pod
+func keepsIP(current, other *informer.ObjectMeta) bool {
+	return qName(current) != qName(other) &&
+		current.Pod != nil && !current.Pod.Finished &&
+		other.Pod != nil && other.Pod.Finished
+}
+
 // Deprecated: MetaSourceLabels allow overriding some metadata from kubernetes labels,
 // Left for backwards-compatibility.
 type MetaSourceLabels struct {
@@ -309,6 +317,9 @@ func (s *Store) unlockedAddObjectMeta(meta *informer.ObjectMeta) {
 	s.objectMetaByQName[qn] = cmeta
 
 	for _, ip := range meta.Ips {
+		if current, ok := s.objectMetaByIP[ip]; ok && keepsIP(current.Meta, meta) {
+			continue
+		}
 		s.objectMetaByIP[ip] = cmeta
 	}
 
@@ -352,7 +363,10 @@ func (s *Store) deleteObjectMeta(meta *informer.ObjectMeta) {
 func (s *Store) unlockedDeleteObjectMeta(meta *informer.ObjectMeta) {
 	delete(s.objectMetaByQName, qName(meta))
 	for _, ip := range meta.Ips {
-		delete(s.objectMetaByIP, ip)
+		// the IP may already belong to another object, e.g. a new Pod that reused the IP of a finished one
+		if current, ok := s.objectMetaByIP[ip]; ok && qName(current.Meta) == qName(meta) {
+			delete(s.objectMetaByIP, ip)
+		}
 	}
 	if meta.Pod != nil {
 		oID := fetchOwnerID(meta)
