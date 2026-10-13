@@ -9,6 +9,9 @@
 #include <netolly/flow.h>
 
 #define DISCARD 1
+#ifndef EEXIST
+#define EEXIST 17
+#endif
 #define SUBMIT 0
 
 // according to field 61 in https://www.iana.org/assignments/ipfix/ipfix.xhtml
@@ -92,6 +95,20 @@ struct {
     __type(key, conn_initiator_key);
     __type(value, u8);
 } conn_initiators SEC(".maps");
+
+// Adds a packet to this CPU's slot of a flow entry, in place. The caller must not write the value back
+// with bpf_map_update_elem: if user space deleted the entry since the lookup, that would re-insert it
+// with the bytes user space already read, and they would be counted twice.
+static __always_inline void add_packet(flow_metrics *m, u32 len, u64 now, u16 flags) {
+    m->packets += 1;
+    m->bytes += len;
+    m->end_mono_time_ns = now;
+    // a CPU's slot is zero when another CPU created the entry
+    if (m->start_mono_time_ns == 0) {
+        m->start_mono_time_ns = now;
+    }
+    m->flags |= flags;
+}
 
 const u8 ip4in6[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
 
