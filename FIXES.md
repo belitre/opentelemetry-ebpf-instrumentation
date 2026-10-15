@@ -55,22 +55,10 @@ Flow bytes were checked against the AWS Cost and Usage Report per instance and h
 - **Fix:** `backoffFetch` runs the attempts under a context with the retry timeout, so an attempt that hangs is cancelled
   when the retry time is up.
 
-# Observed, not fixed
+## 4. Bytes and packets counted per merged packet, not per segment (GRO/TSO)
 
-## A. A sending agent briefly reports a flow before it has identified its own Pod
-
-- When a Pod opens a connection to a Pod on another node, the sending node's agent sometimes exports a series for that
-  flow with the source unidentified (no `k8s_src_*`, the source named after its subnet) holding only a few hundred bytes,
-  while the receiving agent reports the same flow, under the same labels, with the full byte count. The series stays at
-  that value until it expires.
-- Impact: anything that deduplicates the two agents' reports by averaging them halves the receiver's bytes while that
-  series is new. Worked around outside OBI by preferring the receiving agent's series.
-- To check before an issue: whether it is the first packets of a connection seen before the Pod's IP is in the local
-  store, and whether it happens with the k8s-cache too.
-
-## B. Bytes and packets counted per merged packet, not per segment (GRO/TSO)
-
-- **Status:** proven, not fixed yet.
+- **Status:** fixed in this branch (`fix(netolly): count GRO/TSO segments as the wire carries them`). No upstream issue
+  or PR yet.
 - **What happens:** the flow programs count `skb->len` and one packet per skb. On receive, GRO has already merged TCP
   segments into one skb; on send, the hook sees the skb before TSO/GSO splits it. So a merged skb carries one set of
   IP/TCP headers where the wire (and the cloud bill) has one per segment, and the packet count is the number of skbs, not
@@ -88,5 +76,20 @@ Flow bytes were checked against the AWS Cost and Usage Report per instance and h
 
   In production this is the 1–3% gap on inbound traffic (2.3% on traffic from RDS through VPC peering, with 1500-byte
   segments).
-- **Fix to try:** at the capture point add `skb->gso_segs − 1` packets and that many copies of the IP + transport header
-  length (`gso_segs` is readable from `struct __sk_buff`; check which program types and kernels allow it), for TCP skbs with `gso_segs > 1`.
+- **Fix:** for a TCP skb with `gso_segs > 1`, count `gso_segs` packets and add `gso_segs − 1` copies of the segment's
+  L2 + L3 + L4 header length (already parsed from the skb), in both the socket filter and the TC programs. The read of
+  `__sk_buff.gso_segs` is guarded with `bpf_core_field_exists`, so on a kernel without the field the programs still load
+  and count as before.
+
+# Observed, not fixed
+
+## A. A sending agent briefly reports a flow before it has identified its own Pod
+
+- When a Pod opens a connection to a Pod on another node, the sending node's agent sometimes exports a series for that
+  flow with the source unidentified (no `k8s_src_*`, the source named after its subnet) holding only a few hundred bytes,
+  while the receiving agent reports the same flow, under the same labels, with the full byte count. The series stays at
+  that value until it expires.
+- Impact: anything that deduplicates the two agents' reports by averaging them halves the receiver's bytes while that
+  series is new. Worked around outside OBI by preferring the receiving agent's series.
+- To check before an issue: whether it is the first packets of a connection seen before the Pod's IP is in the local
+  store, and whether it happens with the k8s-cache too.
