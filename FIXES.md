@@ -89,4 +89,4 @@ Flow bytes were checked against the AWS Cost and Usage Report per instance and h
   In production this is the 1–3% gap on inbound traffic (2.3% on traffic from RDS through VPC peering, with 1500-byte
   segments).
 - **Fix to try:** at the capture point add `skb->gso_segs − 1` packets and that many copies of the IP + transport header
-  length (both readable from `struct __sk_buff`, `gso_segs` since Linux 5.1), for TCP skbs with `gso_segs > 1`.
+  length (`gso_segs` is readable from `struct __sk_buff`; check which program types and kernels allow it), for TCP skbs with `gso_segs > 1`.
