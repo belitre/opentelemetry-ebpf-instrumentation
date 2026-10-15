@@ -68,11 +68,25 @@ Flow bytes were checked against the AWS Cost and Usage Report per instance and h
 - To check before an issue: whether it is the first packets of a connection seen before the Pod's IP is in the local
   store, and whether it happens with the k8s-cache too.
 
-## B. Inbound bytes 1–3% below the billed bytes
+## B. Bytes and packets counted per merged packet, not per segment (GRO/TSO)
 
-- After the fixes above, the bytes the receiving agent counts are 1–3% below what AWS bills for the same instance and hour
-  (inbound only; outbound matches): ~2.3% on every node for traffic from RDS in a peered VPC, ~1–2% on cross-AZ traffic.
-- Suspected: GRO merges TCP segments before the capture point, so the merged segments' IP/TCP headers are not counted,
-  while the bill counts every segment. Unproven; to check with a controlled transfer at MSS 1448 and at MSS 8949 and
-  compare the counted bytes with the segments sent. If confirmed, the capture could add the headers of
-  `skb->gso_segs - 1` segments.
+- **Status:** proven, not fixed yet.
+- **What happens:** the flow programs count `skb->len` and one packet per skb. On receive, GRO has already merged TCP
+  segments into one skb; on send, the hook sees the skb before TSO/GSO splits it. So a merged skb carries one set of
+  IP/TCP headers where the wire (and the cloud bill) has one per segment, and the packet count is the number of skbs, not
+  segments. The bytes lost are (segments − skbs) × header length.
+- **Evidence (controlled test):** iperf3, exactly 10 GiB of payload between two pods on nodes in different zones,
+  4 streams, counters read after the last export. Expected wire IP bytes = payload + 52 B (IPv4 + TCP with timestamps) ×
+  payload / MSS.
+
+  | MSS | Agent | skbs counted | segments on the wire | counted vs wire | (segments − skbs) × 52 B |
+  |---|---|---|---|---|---|
+  | 8949 (9001 MTU) | receiver | 330,794 | 1,199,846 | −0.41% | −0.42% |
+  | 8949 (9001 MTU) | sender | 542,573 | 1,199,846 | −0.31% | −0.32% |
+  | 1448 (1500 MTU) | receiver | 346,706 | 7,415,344 | −3.30% | −3.30% |
+  | 1448 (1500 MTU) | sender | 3,610,267 | 7,415,344 | −1.77% | −1.78% |
+
+  In production this is the 1–3% gap on inbound traffic (2.3% on traffic from RDS through VPC peering, with 1500-byte
+  segments).
+- **Fix to try:** at the capture point add `skb->gso_segs − 1` packets and that many copies of the IP + transport header
+  length (both readable from `struct __sk_buff`, `gso_segs` since Linux 5.1), for TCP skbs with `gso_segs > 1`.
