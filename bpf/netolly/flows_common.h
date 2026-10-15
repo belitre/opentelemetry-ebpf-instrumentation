@@ -5,6 +5,7 @@
 
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_helpers.h>
+#include <bpfcore/bpf_core_read.h>
 
 #include <netolly/flow.h>
 
@@ -99,15 +100,33 @@ struct {
 // Adds a packet to this CPU's slot of a flow entry, in place. The caller must not write the value back
 // with bpf_map_update_elem: if user space deleted the entry since the lookup, that would re-insert it
 // with the bytes user space already read, and they would be counted twice.
-static __always_inline void add_packet(flow_metrics *m, u32 len, u64 now, u16 flags) {
-    m->packets += 1;
-    m->bytes += len;
+static __always_inline void add_packet(flow_metrics *m, u32 packets, u64 bytes, u64 now, u16 flags) {
+    m->packets += packets;
+    m->bytes += bytes;
     m->end_mono_time_ns = now;
     // a CPU's slot is zero when another CPU created the entry
     if (m->start_mono_time_ns == 0) {
         m->start_mono_time_ns = now;
     }
     m->flags |= flags;
+}
+
+// Packets and bytes of an skb as they are on the wire. GRO (receive) and TSO/GSO (send) hand the hooks one skb for
+// several TCP segments, with one set of headers where the wire has one per segment, so skb->len and a count of 1 miss
+// (gso_segs - 1) packets and that many copies of the headers. seg_hdr_len is the L2 + L3 + L4 header length of a
+// segment (0 when unknown: the skb is counted as is). On a kernel whose __sk_buff has no gso_segs, the CO-RE check is
+// false at load time, the read is never verified and every skb counts as one packet, as before.
+static __always_inline void skb_wire_size(struct __sk_buff *skb, u32 seg_hdr_len, u32 *packets, u64 *bytes) {
+    u32 segs = 1;
+    if (bpf_core_field_exists(skb->gso_segs)) {
+        segs = skb->gso_segs;
+    }
+    *packets = 1;
+    *bytes = skb->len;
+    if (seg_hdr_len > 0 && segs > 1) {
+        *packets = segs;
+        *bytes += (u64)(segs - 1) * seg_hdr_len;
+    }
 }
 
 const u8 ip4in6[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
