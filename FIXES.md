@@ -26,9 +26,9 @@ Flow bytes were checked against the AWS Cost and Usage Report per instance and h
 
 ## 2. Kubernetes metadata lost for a Pod that reuses the IP of a finished Pod
 
-- **Status:** fixed in this branch (`fix(kube): keep a Pod's metadata when it reuses the IP of a finished Pod`).
-  Upstream issue: open-telemetry/opentelemetry-ebpf-instrumentation#3726 (open). The PR is not opened upstream yet; a
-  review copy is belitre/opentelemetry-ebpf-instrumentation#1.
+- **Status:** fixed in this branch (`fix(kube): keep a Pod's metadata when it reuses the IP of a finished Pod`) and
+  merged upstream in open-telemetry/opentelemetry-ebpf-instrumentation#3789 (closes #3726), not in an OBI or Beyla release
+  yet. Drop it from this branch once a Beyla release vendors an OBI that includes it.
 - **What happens:** a finished Pod keeps its IP in `Status.PodIPs`; when the CNI gives the IP to a new Pod and the finished
   Pod is then deleted or updated, the new Pod's entry is removed from the IP index and its flows lose their metadata until
   the agent restarts.
