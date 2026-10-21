@@ -50,7 +50,8 @@ struct __udphdr {
     __sum16 check;
 };
 
-static __always_inline bool read_sk_buff(struct __sk_buff *skb, flow_id *id, u16 *custom_flags) {
+static __always_inline bool
+read_sk_buff(struct __sk_buff *skb, flow_id *id, u16 *custom_flags, u32 *seg_hdr_len) {
     // we read the protocol just like here linux/samples/bpf/parse_ldabs.c
     u16 h_proto;
     bpf_skb_load_bytes(skb, offsetof(struct ethhdr, h_proto), &h_proto, sizeof(h_proto));
@@ -148,6 +149,7 @@ static __always_inline bool read_sk_buff(struct __sk_buff *skb, flow_id *id, u16
         if ((skb->len - hdr_len) < 0) { // less than 0 is a packet we can't parse
             return false;
         }
+        *seg_hdr_len = hdr_len;
 
         break;
     }
@@ -193,11 +195,15 @@ int obi_socket__filter(struct __sk_buff *skb) {
     }
 
     u16 flags = 0;
+    u32 seg_hdr_len = 0;
     flow_id id;
     __builtin_memset(&id, 0, sizeof(id));
-    if (!read_sk_buff(skb, &id, &flags)) {
+    if (!read_sk_buff(skb, &id, &flags, &seg_hdr_len)) {
         return TC_ACT_UNSPEC;
     }
+    u32 packets;
+    u64 bytes;
+    skb_wire_size(skb, seg_hdr_len, &packets, &bytes);
 
     // ignore traffic that's not egress or ingress
     if (same_ip(id.src_ip.s6_addr, id.dst_ip.s6_addr)) {
@@ -218,34 +224,12 @@ int obi_socket__filter(struct __sk_buff *skb) {
     // a spinlocked alternative version and use it selectively https://lwn.net/Articles/779120/
     flow_metrics *aggregate_flow = (flow_metrics *)bpf_map_lookup_elem(&aggregated_flows, &id);
     if (aggregate_flow) {
-        aggregate_flow->packets += 1;
-        aggregate_flow->bytes += skb->len;
-        aggregate_flow->end_mono_time_ns = current_time;
-        // it might happen that start_mono_time hasn't been set due to
-        // the way percpu hashmap deal with concurrent map entries
-        if (aggregate_flow->start_mono_time_ns == 0) {
-            aggregate_flow->start_mono_time_ns = current_time;
-        }
-        aggregate_flow->flags |= flags;
-
-        const long ret = bpf_map_update_elem(&aggregated_flows, &id, aggregate_flow, BPF_ANY);
-        if (trace_messages && ret != 0) {
-            // usually error -16 (-EBUSY) is printed here.
-            // In this case, the flow is dropped, as submitting it to the ringbuffer would cause
-            // a duplicated UNION of flows (two different flows with partial aggregation of the same packets),
-            // which can't be deduplicated.
-            // other possible values https://chromium.googlesource.com/chromiumos/docs/+/master/constants/errnos.md
-            bpf_dbg_printk("error updating flow, ret=%d. Bytes=%d\n", ret, skb->len);
-
-            if (packet_stats) {
-                packet_stats->ignored++;
-            }
-        }
+        add_packet(aggregate_flow, packets, bytes, current_time, flags);
     } else {
         // Key does not exist in the map, and will need to create a new entry.
         flow_metrics new_flow = {
-            .packets = 1,
-            .bytes = skb->len,
+            .packets = packets,
+            .bytes = bytes,
             .start_mono_time_ns = current_time,
             .end_mono_time_ns = current_time,
             .flags = flags,
@@ -282,9 +266,16 @@ int obi_socket__filter(struct __sk_buff *skb) {
 
         new_flow.initiator = get_connection_initiator(&id, flags);
 
-        // even if we know that the entry is new, another CPU might be concurrently inserting a flow
-        // so we need to specify BPF_ANY
-        const long ret = bpf_map_update_elem(&aggregated_flows, &id, &new_flow, BPF_ANY);
+        // BPF_NOEXIST: another CPU may have created the entry since our lookup, and replacing it would
+        // drop what that CPU counted. Then add this packet to our slot of that entry instead.
+        long ret = bpf_map_update_elem(&aggregated_flows, &id, &new_flow, BPF_NOEXIST);
+        if (ret == -EEXIST) {
+            aggregate_flow = (flow_metrics *)bpf_map_lookup_elem(&aggregated_flows, &id);
+            if (aggregate_flow) {
+                add_packet(aggregate_flow, packets, bytes, current_time, flags);
+                ret = 0;
+            }
+        }
         if (ret != 0) {
             // usually error -16 (-EBUSY) or -7 (E2BIG) is printed here.
             // In this case, we send the single-packet flow via ringbuffer as in the worst case we can have

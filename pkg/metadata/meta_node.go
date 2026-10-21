@@ -167,6 +167,14 @@ func fetchEntries(
 func backoffFetch(ctx context.Context, retryCfg RetryConfig, fetch fetcher, log *slog.Logger) NodeMeta {
 	backoff := retryCfg.StartInterval
 	start := time.Now()
+	if retryCfg.Timeout > 0 {
+		// The timeout bounds the whole retry, attempts included: a fetcher whose request hangs (e.g. the
+		// Kubernetes API Service IP before kube-proxy has programmed it on a new node) would otherwise
+		// keep the startup waiting for the fetcher's own timeout, however short the retry timeout is.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, retryCfg.Timeout)
+		defer cancel()
+	}
 	for {
 		entries, err := fetch(ctx)
 		if err == nil {

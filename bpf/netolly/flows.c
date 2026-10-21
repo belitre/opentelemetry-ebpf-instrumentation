@@ -58,7 +58,8 @@ static inline void set_flags(struct tcphdr *th, u16 *flags) {
     }
 }
 // sets flow fields from IPv4 header information
-static inline int fill_iphdr(struct iphdr *ip, void *data_end, flow_id *id, u16 *flags) {
+static inline int
+fill_iphdr(struct iphdr *ip, void *data_end, flow_id *id, u16 *flags, u32 *seg_hdr_len) {
     if ((void *)ip + sizeof(*ip) > data_end) {
         return DISCARD;
     }
@@ -77,6 +78,7 @@ static inline int fill_iphdr(struct iphdr *ip, void *data_end, flow_id *id, u16 
             id->src_port = __bpf_ntohs(tcp->source);
             id->dst_port = __bpf_ntohs(tcp->dest);
             set_flags(tcp, flags);
+            *seg_hdr_len = sizeof(struct ethhdr) + (u32)ip->ihl * 4 + (u32)tcp->doff * 4;
         }
     } break;
     case IPPROTO_UDP: {
@@ -93,7 +95,8 @@ static inline int fill_iphdr(struct iphdr *ip, void *data_end, flow_id *id, u16 
 }
 
 // sets flow fields from IPv6 header information
-static inline int fill_ip6hdr(struct ipv6hdr *ip, void *data_end, flow_id *id, u16 *flags) {
+static inline int
+fill_ip6hdr(struct ipv6hdr *ip, void *data_end, flow_id *id, u16 *flags, u32 *seg_hdr_len) {
     if ((void *)ip + sizeof(*ip) > data_end) {
         return DISCARD;
     }
@@ -110,6 +113,7 @@ static inline int fill_ip6hdr(struct ipv6hdr *ip, void *data_end, flow_id *id, u
             id->src_port = __bpf_ntohs(tcp->source);
             id->dst_port = __bpf_ntohs(tcp->dest);
             set_flags(tcp, flags);
+            *seg_hdr_len = sizeof(struct ethhdr) + sizeof(*ip) + (u32)tcp->doff * 4;
         }
     } break;
     case IPPROTO_UDP: {
@@ -125,7 +129,8 @@ static inline int fill_ip6hdr(struct ipv6hdr *ip, void *data_end, flow_id *id, u
     return SUBMIT;
 }
 // sets flow fields from Ethernet header information
-static inline int fill_ethhdr(struct ethhdr *eth, void *data_end, flow_id *id, u16 *flags) {
+static inline int
+fill_ethhdr(struct ethhdr *eth, void *data_end, flow_id *id, u16 *flags, u32 *seg_hdr_len) {
     if ((void *)eth + sizeof(*eth) > data_end) {
         return DISCARD;
     }
@@ -134,10 +139,10 @@ static inline int fill_ethhdr(struct ethhdr *eth, void *data_end, flow_id *id, u
 
     if (id->eth_protocol == ETH_P_IP) {
         struct iphdr *ip = (struct iphdr *)((void *)eth + sizeof(*eth));
-        return fill_iphdr(ip, data_end, id, flags);
+        return fill_iphdr(ip, data_end, id, flags, seg_hdr_len);
     } else if (id->eth_protocol == ETH_P_IPV6) {
         struct ipv6hdr *ip6 = (struct ipv6hdr *)((void *)eth + sizeof(*eth));
-        return fill_ip6hdr(ip6, data_end, id, flags);
+        return fill_ip6hdr(ip6, data_end, id, flags, seg_hdr_len);
     } else {
         // TODO : Need to implement other specific ethertypes if needed
         // For now other parts of flow id remain zero
@@ -162,9 +167,13 @@ static inline int flow_monitor(struct __sk_buff *skb) {
     __builtin_memset(&id, 0, sizeof(id));
     struct ethhdr *eth = (struct ethhdr *)data;
     u16 flags = 0;
-    if (fill_ethhdr(eth, data_end, &id, &flags) == DISCARD) {
+    u32 seg_hdr_len = 0;
+    if (fill_ethhdr(eth, data_end, &id, &flags, &seg_hdr_len) == DISCARD) {
         return TC_ACT_UNSPEC;
     }
+    u32 packets;
+    u64 bytes;
+    skb_wire_size(skb, seg_hdr_len, &packets, &bytes);
     id.if_index = skb->ifindex;
 
     const u64 current_time = bpf_ktime_get_ns();
@@ -180,34 +189,12 @@ static inline int flow_monitor(struct __sk_buff *skb) {
     // a spinlocked alternative version and use it selectively https://lwn.net/Articles/779120/
     flow_metrics *aggregate_flow = (flow_metrics *)bpf_map_lookup_elem(&aggregated_flows, &id);
     if (aggregate_flow) {
-        aggregate_flow->packets += 1;
-        aggregate_flow->bytes += skb->len;
-        aggregate_flow->end_mono_time_ns = current_time;
-        // it might happen that start_mono_time hasn't been set due to
-        // the way percpu hashmap deal with concurrent map entries
-        if (aggregate_flow->start_mono_time_ns == 0) {
-            aggregate_flow->start_mono_time_ns = current_time;
-        }
-        aggregate_flow->flags |= flags;
-
-        const long ret = bpf_map_update_elem(&aggregated_flows, &id, aggregate_flow, BPF_ANY);
-        if (trace_messages && ret != 0) {
-            // usually error -16 (-EBUSY) is printed here.
-            // In this case, the flow is dropped, as submitting it to the ringbuffer would cause
-            // a duplicated UNION of flows (two different flows with partial aggregation of the same packets),
-            // which can't be deduplicated.
-            // other possible values https://chromium.googlesource.com/chromiumos/docs/+/master/constants/errnos.md
-            bpf_dbg_printk("error updating flow, ret=%d. Bytes=%d\n", ret, skb->len);
-
-            if (packet_stats) {
-                packet_stats->ignored++;
-            }
-        }
+        add_packet(aggregate_flow, packets, bytes, current_time, flags);
     } else {
         // Key does not exist in the map, and will need to create a new entry.
         flow_metrics new_flow = {
-            .packets = 1,
-            .bytes = skb->len,
+            .packets = packets,
+            .bytes = bytes,
             .start_mono_time_ns = current_time,
             .end_mono_time_ns = current_time,
             .flags = flags,
@@ -245,9 +232,16 @@ static inline int flow_monitor(struct __sk_buff *skb) {
 
         new_flow.initiator = get_connection_initiator(&id, flags);
 
-        // even if we know that the entry is new, another CPU might be concurrently inserting a flow
-        // so we need to specify BPF_ANY
-        const long ret = bpf_map_update_elem(&aggregated_flows, &id, &new_flow, BPF_ANY);
+        // BPF_NOEXIST: another CPU may have created the entry since our lookup, and replacing it would
+        // drop what that CPU counted. Then add this packet to our slot of that entry instead.
+        long ret = bpf_map_update_elem(&aggregated_flows, &id, &new_flow, BPF_NOEXIST);
+        if (ret == -EEXIST) {
+            aggregate_flow = (flow_metrics *)bpf_map_lookup_elem(&aggregated_flows, &id);
+            if (aggregate_flow) {
+                add_packet(aggregate_flow, packets, bytes, current_time, flags);
+                ret = 0;
+            }
+        }
         if (ret != 0) {
             // usually error -16 (-EBUSY) or -7 (E2BIG) is printed here.
             // In this case, we send the single-packet flow via ringbuffer as in the worst case we can have
