@@ -37,8 +37,8 @@ Flow bytes were checked against the AWS Cost and Usage Report per instance and h
 
 ## 3. `metadata_retry.timeout` does not bound a hanging attempt (agent blind for 30 s on new nodes)
 
-- **Status:** fixed in this branch (`fix(metadata): the retry timeout also bounds a hanging attempt`). No upstream issue or
-  PR yet.
+- **Status:** fixed in this branch (`fix(metadata): the retry timeout also bounds a hanging attempt`). Upstream issue
+  open-telemetry/opentelemetry-ebpf-instrumentation#3826, PR #3827 (open).
 - **What happens:** the agent only starts collecting after the node metadata fetchers finish. `attributes.metadata_retry.timeout`
   (`OTEL_EBPF_METADATA_RETRY_TIMEOUT`, documented as the maximum total time for all retry attempts) is only checked
   between attempts, while the Kubernetes node fetcher gives each attempt its own hardcoded 30 s
