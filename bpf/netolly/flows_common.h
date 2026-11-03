@@ -94,6 +94,21 @@ struct {
     __type(value, u8);
 } conn_initiators SEC(".maps");
 
+// Adds a packet to this CPU's slot of a flow entry, in place. The caller must not write the value
+// back with bpf_map_update_elem: if user space deleted the entry since the lookup, that would
+// re-insert it with the bytes user space already read, and they would be counted twice.
+static __always_inline void
+add_packet(flow_metrics *m, u32 packets, u64 bytes, u64 now, u16 flags) {
+    m->packets += packets;
+    m->bytes += bytes;
+    m->end_mono_time_ns = now;
+    // start_mono_time_ns stays 0 in a CPU's slot when another CPU created the entry (user space
+    // sets up the map so new entries start zeroed, see zeroFilledFlowSlots in
+    // pkg/internal/netolly/ebpf): that slot has no direction or initiator, so user space takes
+    // them and the start time from the slot of the CPU that created the entry
+    m->flags |= flags;
+}
+
 // Packets and bytes of an skb as they are on the wire. GRO (receive) and TSO/GSO (send) hand the
 // hooks one skb for several TCP segments, with one set of headers where the wire has one per
 // segment, so skb->len and a count of 1 miss (gso_segs - 1) packets and that many copies of the
